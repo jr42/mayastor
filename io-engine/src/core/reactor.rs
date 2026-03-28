@@ -918,22 +918,15 @@ impl Future for &'static Reactor {
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         match self.get_state() {
             ReactorState::Running => {
-                if self.interrupt_enabled {
-                    // Single-core interrupt mode: poll once and check for
-                    // idleness. If idle, transition to Interrupt state.
-                    let completions = self.poll_once_counted();
-                    if self.idle_threshold == 0 {
-                        // Always-interrupt: go to interrupt after every poll
-                        self.set_state(ReactorState::Interrupt);
-                    } else if completions == 0 {
-                        let ticks = self.idle_ticks.get() + 1;
-                        self.idle_ticks.set(ticks);
-                        if ticks >= self.idle_threshold {
-                            self.set_state(ReactorState::Interrupt);
-                        }
-                    } else {
-                        self.idle_ticks.set(0);
-                    }
+                if self.interrupt_enabled && self.epoll_fd >= 0 {
+                    // Single-core interrupt mode: poll, then sleep in
+                    // epoll_wait until events arrive. This blocks the
+                    // tokio thread briefly but avoids 100% CPU.
+                    self.poll_once();
+                    self.switch_threads_to_interrupt();
+                    self.wait_for_events();
+                    self.switch_threads_to_poll();
+                    self.poll_once();
                 } else {
                     self.poll_times(3);
                 }
