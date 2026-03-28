@@ -159,12 +159,8 @@ impl Reactors {
             if !(mempool_sz+1).is_power_of_two() {
                 tracing::warn!("The provided SPDK_DEFAULT_MSG_MEMPOOL_SIZE ({SPDK_DEFAULT_MSG_MEMPOOL_SIZE}) is not a power of 2 - 1. This is not optimal for memory consumption");
             }
-            let rc = unsafe {
-                spdk_thread_lib_init_ext(Some(Self::do_op), Some(Self::can_op), 0, mempool_sz)
-            };
-            assert_eq!(rc, 0);
-
             // Enable SPDK interrupt mode globally if requested.
+            // Must be called BEFORE spdk_thread_lib_init_ext().
             if interrupt_mode {
                 let rc = spdk_rs::Thread::interrupt_mode_enable();
                 if rc != 0 {
@@ -177,6 +173,11 @@ impl Reactors {
                     info!("SPDK interrupt mode enabled globally");
                 }
             }
+
+            let rc = unsafe {
+                spdk_thread_lib_init_ext(Some(Self::do_op), Some(Self::can_op), 0, mempool_sz)
+            };
+            assert_eq!(rc, 0);
 
             let num_cores = Cores::count().into_iter().count();
             let interrupt_available = interrupt_mode
