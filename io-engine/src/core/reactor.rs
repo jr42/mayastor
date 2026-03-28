@@ -34,6 +34,7 @@ use std::{
     collections::VecDeque,
     fmt::{self, Debug, Display, Formatter},
     future::Future,
+    os::fd::RawFd,
     os::raw::c_void,
     pin::Pin,
     slice::Iter,
@@ -69,6 +70,8 @@ pub enum ReactorState {
     Running,
     Shutdown,
     Delayed,
+    /// Epoll-based interrupt mode: reactor sleeps until I/O events arrive.
+    Interrupt,
 }
 
 impl Display for ReactorState {
@@ -78,6 +81,7 @@ impl Display for ReactorState {
             ReactorState::Running => "Running",
             ReactorState::Shutdown => "Shutdown",
             ReactorState::Delayed => "Delayed",
+            ReactorState::Interrupt => "Interrupt",
         };
         write!(f, "{s}")
     }
@@ -122,6 +126,17 @@ pub struct Reactor {
     /// through FFI
     sx: Sender<Pin<Box<dyn Future<Output = ()> + 'static>>>,
     rx: Receiver<Pin<Box<dyn Future<Output = ()> + 'static>>>,
+    /// Whether interrupt mode is enabled for this reactor.
+    interrupt_enabled: bool,
+    /// Counter of consecutive idle polls (zero completions).
+    idle_ticks: Cell<u64>,
+    /// Number of consecutive idle polls before entering interrupt mode.
+    /// 0 means always use interrupt mode (no adaptive switching).
+    idle_threshold: u64,
+    /// eventfd used to wake the reactor from epoll_wait when futures arrive.
+    wakeup_fd: RawFd,
+    /// epoll instance for interrupt mode waiting.
+    epoll_fd: RawFd,
 }
 
 thread_local! {
@@ -131,7 +146,11 @@ thread_local! {
 
 impl Reactors {
     /// initialize the reactor subsystem for each core assigned to us
-    pub fn init(developer_delay: bool) {
+    pub fn init(
+        developer_delay: bool,
+        interrupt_mode: bool,
+        interrupt_idle_threshold: u64,
+    ) {
         REACTOR_LIST.get_or_init(|| {
             let mempool_sz = try_from_env(
                 "SPDK_DEFAULT_MSG_MEMPOOL_SIZE",
@@ -145,10 +164,44 @@ impl Reactors {
             };
             assert_eq!(rc, 0);
 
+            // Enable SPDK interrupt mode globally if requested.
+            if interrupt_mode {
+                let rc = spdk_rs::Thread::interrupt_mode_enable();
+                if rc != 0 {
+                    error!(
+                        "Failed to enable SPDK interrupt mode (rc={}), \
+                         falling back to poll mode",
+                        rc
+                    );
+                } else {
+                    info!("SPDK interrupt mode enabled globally");
+                }
+            }
+
+            let num_cores = Cores::count().into_iter().count();
+            let interrupt_available = interrupt_mode
+                && spdk_rs::Thread::interrupt_mode_is_enabled();
+
             Reactors(
                 Cores::count()
                     .into_iter()
-                    .map(|core| Reactor::new(core, developer_delay))
+                    .map(|core| {
+                        // For multi-core: enable interrupt on remote cores
+                        // only (master core uses tokio, can't block in epoll).
+                        // For single-core: enable on the master core too,
+                        // using a different waiting strategy in the Future impl.
+                        let core_interrupt = if num_cores == 1 {
+                            interrupt_available
+                        } else {
+                            interrupt_available && core != Cores::first()
+                        };
+                        Reactor::new(
+                            core,
+                            developer_delay,
+                            core_interrupt,
+                            interrupt_idle_threshold,
+                        )
+                    })
                     .collect::<Vec<_>>(),
             )
         });
@@ -279,9 +332,57 @@ impl<'a> IntoIterator for &'a Reactors {
 
 impl Reactor {
     /// create a new ['Reactor'] instance
-    fn new(core: u32, developer_delay: bool) -> Self {
+    fn new(
+        core: u32,
+        developer_delay: bool,
+        interrupt_enabled: bool,
+        interrupt_idle_threshold: u64,
+    ) -> Self {
         // create a channel to receive futures on
         let (sx, rx) = unbounded::<Pin<Box<dyn Future<Output = ()> + 'static>>>();
+
+        // Create eventfd and epoll for interrupt mode wakeup.
+        // These are created unconditionally but only used when
+        // interrupt_enabled is true.
+        let wakeup_fd = if interrupt_enabled {
+            unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) }
+        } else {
+            -1
+        };
+
+        let epoll_fd = if interrupt_enabled {
+            unsafe { libc::epoll_create1(0) }
+        } else {
+            -1
+        };
+
+        if interrupt_enabled {
+            if wakeup_fd < 0 || epoll_fd < 0 {
+                panic!(
+                    "Failed to create eventfd/epoll for interrupt mode on core {}",
+                    core,
+                );
+            }
+            // Register wakeup_fd in the epoll set so we can wake
+            // from epoll_wait when futures arrive.
+            let mut ev = libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: wakeup_fd as u64,
+            };
+            let rc = unsafe {
+                libc::epoll_ctl(
+                    epoll_fd,
+                    libc::EPOLL_CTL_ADD,
+                    wakeup_fd,
+                    &mut ev,
+                )
+            };
+            assert_eq!(rc, 0, "Failed to add wakeup_fd to epoll");
+            info!(
+                "Reactor core {}: interrupt mode enabled (idle_threshold={})",
+                core, interrupt_idle_threshold,
+            );
+        }
 
         Self {
             threads: RefCell::new(VecDeque::new()),
@@ -292,6 +393,11 @@ impl Reactor {
             tid: Cell::new(0),
             sx,
             rx,
+            interrupt_enabled,
+            idle_ticks: Cell::new(0),
+            idle_threshold: interrupt_idle_threshold,
+            wakeup_fd,
+            epoll_fd,
         }
     }
 
@@ -333,6 +439,17 @@ impl Reactor {
         F: Future<Output = ()> + 'static,
     {
         self.sx.send(Box::pin(future)).unwrap();
+        // Wake the reactor if it may be sleeping in interrupt mode.
+        if self.interrupt_enabled && self.wakeup_fd >= 0 {
+            let val: u64 = 1;
+            unsafe {
+                libc::write(
+                    self.wakeup_fd,
+                    &val as *const u64 as *const libc::c_void,
+                    std::mem::size_of::<u64>(),
+                );
+            }
+        }
     }
 
     /// spawn a future locally on this core; note that you can *not* use the
@@ -404,7 +521,8 @@ impl Reactor {
             ReactorState::Init
             | ReactorState::Delayed
             | ReactorState::Shutdown
-            | ReactorState::Running => {
+            | ReactorState::Running
+            | ReactorState::Interrupt => {
                 self.flags.set(state);
             }
         }
@@ -463,6 +581,30 @@ impl Reactor {
                 // running is the default mode for all cores. All cores, except
                 // the master core spin within this specific loop
                 ReactorState::Running => {
+                    if self.interrupt_enabled {
+                        let completions = self.poll_once_counted();
+                        if self.idle_threshold == 0 {
+                            // Always-interrupt: re-enter after every poll
+                            self.enter_interrupt_mode();
+                        } else if completions == 0 {
+                            // Adaptive: count idle ticks
+                            let ticks = self.idle_ticks.get() + 1;
+                            self.idle_ticks.set(ticks);
+                            if ticks >= self.idle_threshold {
+                                self.enter_interrupt_mode();
+                            }
+                        } else {
+                            self.idle_ticks.set(0);
+                        }
+                    } else {
+                        self.poll_once();
+                    }
+                }
+                ReactorState::Interrupt => {
+                    // Block on epoll until I/O events or wakeup signal.
+                    self.wait_for_events();
+                    self.exit_interrupt_mode();
+                    // Poll immediately after waking to process events.
                     self.poll_once();
                 }
                 ReactorState::Shutdown => {
@@ -477,6 +619,16 @@ impl Reactor {
             }
 
             self.destroy_exited();
+        }
+
+        // Cleanup interrupt mode resources.
+        if self.interrupt_enabled {
+            if self.epoll_fd >= 0 {
+                unsafe { libc::close(self.epoll_fd) };
+            }
+            if self.wakeup_fd >= 0 {
+                unsafe { libc::close(self.wakeup_fd) };
+            }
         }
 
         debug!("initiating shutdown for core {}", Cores::current());
@@ -500,6 +652,128 @@ impl Reactor {
         drop(threads);
 
         self.add_incoming();
+    }
+
+    /// Like poll_once but returns the total number of completions across
+    /// all threads. Used by interrupt mode to detect idle periods.
+    #[inline]
+    fn poll_once_counted(&self) -> i32 {
+        self.receive_futures();
+        self.run_futures();
+        let threads = self.threads.borrow();
+        let mut total = 0i32;
+        threads.iter().for_each(|t| {
+            total += t.poll_counted();
+        });
+
+        drop(threads);
+
+        self.add_incoming();
+        total
+    }
+
+    /// Switch all SPDK threads on this reactor into interrupt mode
+    /// and register their interrupt fds in the epoll set.
+    fn switch_threads_to_interrupt(&self) {
+        let threads = self.threads.borrow();
+
+        for t in threads.iter() {
+            // set_interrupt_mode operates on the *current* SPDK thread,
+            // so we must set each thread as current before calling it.
+            t.set_current();
+            spdk_rs::Thread::set_interrupt_mode(true);
+
+            let fd = t.get_interrupt_fd();
+            if fd >= 0 {
+                let mut ev = libc::epoll_event {
+                    events: libc::EPOLLIN as u32,
+                    u64: fd as u64,
+                };
+                unsafe {
+                    // Use EPOLL_CTL_ADD; ignore EEXIST (fd already registered).
+                    let rc = libc::epoll_ctl(
+                        self.epoll_fd,
+                        libc::EPOLL_CTL_ADD,
+                        fd,
+                        &mut ev,
+                    );
+                    if rc < 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.raw_os_error() != Some(libc::EEXIST) {
+                            warn!(
+                                "Failed to add thread interrupt fd {} to epoll: {}",
+                                fd, err,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        drop(threads);
+    }
+
+    /// Switch all SPDK threads back to poll mode.
+    fn switch_threads_to_poll(&self) {
+        let threads = self.threads.borrow();
+        for t in threads.iter() {
+            t.set_current();
+            spdk_rs::Thread::set_interrupt_mode(false);
+        }
+        drop(threads);
+    }
+
+    /// Enter interrupt mode on a remote core (used in poll_reactor loop).
+    /// Sets reactor state to Interrupt.
+    fn enter_interrupt_mode(&self) {
+        self.switch_threads_to_interrupt();
+        self.set_state(ReactorState::Interrupt);
+    }
+
+    /// Enter interrupt mode on the master core (used in Future impl).
+    /// Does NOT change reactor state (caller manages state).
+    fn enter_interrupt_mode_for_master(&self) {
+        self.switch_threads_to_interrupt();
+    }
+
+    /// Exit interrupt mode and return to Running state.
+    fn exit_interrupt_mode(&self) {
+        self.switch_threads_to_poll();
+        self.idle_ticks.set(0);
+        self.set_state(ReactorState::Running);
+    }
+
+    /// Block on epoll_wait until I/O events arrive or timeout expires.
+    /// The timeout allows periodic checks for shutdown requests and
+    /// incoming futures.
+    fn wait_for_events(&self) {
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 32];
+        let timeout_ms = 100; // 100ms timeout for responsiveness
+
+        let n = unsafe {
+            libc::epoll_wait(
+                self.epoll_fd,
+                events.as_mut_ptr(),
+                events.len() as i32,
+                timeout_ms,
+            )
+        };
+
+        // Drain the wakeup eventfd if it was signaled.
+        if n > 0 {
+            for i in 0..n as usize {
+                if events[i].u64 == self.wakeup_fd as u64 {
+                    let mut val: u64 = 0;
+                    unsafe {
+                        libc::read(
+                            self.wakeup_fd,
+                            &mut val as *mut u64 as *mut libc::c_void,
+                            std::mem::size_of::<u64>(),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// poll the threads n times but only poll the futures queue once and look
@@ -643,7 +917,25 @@ impl Future for &'static Reactor {
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         match self.get_state() {
             ReactorState::Running => {
-                self.poll_times(3);
+                if self.interrupt_enabled {
+                    // Single-core interrupt mode: poll once and check for
+                    // idleness. If idle, transition to Interrupt state.
+                    let completions = self.poll_once_counted();
+                    if self.idle_threshold == 0 {
+                        // Always-interrupt: go to interrupt after every poll
+                        self.set_state(ReactorState::Interrupt);
+                    } else if completions == 0 {
+                        let ticks = self.idle_ticks.get() + 1;
+                        self.idle_ticks.set(ticks);
+                        if ticks >= self.idle_threshold {
+                            self.set_state(ReactorState::Interrupt);
+                        }
+                    } else {
+                        self.idle_ticks.set(0);
+                    }
+                } else {
+                    self.poll_times(3);
+                }
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
@@ -667,6 +959,28 @@ impl Future for &'static Reactor {
             ReactorState::Delayed => {
                 std::thread::sleep(Duration::from_millis(1));
                 self.poll_once();
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            ReactorState::Interrupt => {
+                // Master core interrupt mode (single-core setup):
+                // Use a short epoll_wait to avoid busy-spinning while
+                // remaining responsive. This integrates with tokio by
+                // blocking briefly then re-scheduling ourselves.
+                if self.epoll_fd >= 0 {
+                    // Switch SPDK threads to interrupt mode, wait briefly
+                    // for events, then switch back and poll.
+                    self.enter_interrupt_mode_for_master();
+                    self.wait_for_events();
+                    self.exit_interrupt_mode();
+                    self.poll_once();
+                } else {
+                    // Fallback: just sleep briefly like Delayed mode.
+                    std::thread::sleep(Duration::from_millis(1));
+                    self.poll_once();
+                }
+                // Return to Running to re-evaluate on next poll.
+                self.set_state(ReactorState::Running);
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
