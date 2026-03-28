@@ -1,0 +1,40 @@
+name: Build Custom io-engine Image
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (e.g. interrupt-mode)'
+        required: true
+        default: 'interrupt-mode'
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CI: 1
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - uses: cachix/install-nix-action@v31.3.0
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push io-engine image
+        run: |
+          ./scripts/release.sh \
+            --registry ghcr.io/${{ github.repository_owner }} \
+            --alias-tag ${{ inputs.tag }} \
+            --skip-bins

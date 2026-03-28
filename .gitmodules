@@ -1,7 +1,7 @@
 [submodule "spdk-rs"]
 	path = spdk-rs
 	url = ../spdk-rs.git
-	branch = develop
+	branch = feat/interrupt-mode
 [submodule "utils/dependencies"]
 	path = utils/dependencies
 	url = ../mayastor-dependencies.git
