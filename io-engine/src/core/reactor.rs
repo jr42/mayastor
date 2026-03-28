@@ -627,34 +627,48 @@ impl Reactor {
     fn enter_interrupt_mode(&self) {
         let fgrp = match &self.fgrp {
             Some(fg) => fg,
-            None => return,
+            None => {
+                warn!("enter_interrupt_mode: no fd_group on core {}", self.lcore);
+                return;
+            }
         };
 
         let threads = self.threads.borrow();
+        let thread_count = threads.len();
+
         for t in threads.iter() {
-            // Nest the thread's fd_group into the reactor's fd_group
-            // so that spdk_fd_group_wait() on the reactor wakes when
-            // any thread has events.
             let thread_fgrp = t.get_interrupt_fd_group();
             if !thread_fgrp.is_null() {
                 if let Err(rc) = fgrp.nest(thread_fgrp) {
-                    warn!(
-                        "Failed to nest thread '{}' fd_group (rc={})",
-                        t.name(), rc,
-                    );
+                    // EEXIST is expected if already nested from a previous cycle
+                    if rc != -17 { // -EEXIST
+                        warn!(
+                            "Failed to nest thread '{}' fd_group (rc={})",
+                            t.name(), rc,
+                        );
+                    }
                 }
             }
 
-            // Switch the thread to interrupt mode.
             t.set_current();
             spdk_rs::Thread::set_interrupt_mode(true);
         }
         drop(threads);
+
+        // Log once on first entry
+        static ENTER_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let count = ENTER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count == 0 {
+            info!(
+                "Core {}: entered interrupt mode ({} threads nested)",
+                self.lcore, thread_count,
+            );
+        }
+
         self.set_state(ReactorState::Interrupt);
     }
 
-    /// Switch all SPDK threads back to poll mode and unnest their
-    /// fd_groups from the reactor's fd_group.
     fn exit_interrupt_mode(&self) {
         let fgrp = match &self.fgrp {
             Some(fg) => fg,
@@ -663,11 +677,9 @@ impl Reactor {
 
         let threads = self.threads.borrow();
         for t in threads.iter() {
-            // Switch thread back to poll mode first.
             t.set_current();
             spdk_rs::Thread::set_interrupt_mode(false);
 
-            // Unnest the thread's fd_group.
             let thread_fgrp = t.get_interrupt_fd_group();
             if !thread_fgrp.is_null() {
                 let _ = fgrp.unnest(thread_fgrp);
@@ -678,16 +690,22 @@ impl Reactor {
         self.set_state(ReactorState::Running);
     }
 
-    /// Block on the reactor's fd_group until events arrive.
-    ///
-    /// Uses a timeout to periodically check for incoming futures
-    /// and shutdown requests, since those arrive via channels
-    /// rather than SPDK fd_groups.
     fn wait_for_events(&self) {
         if let Some(fgrp) = &self.fgrp {
-            // Use 100ms timeout so we remain responsive to
-            // shutdown requests and incoming futures from other cores.
-            fgrp.wait(100);
+            let before = std::time::Instant::now();
+            let rc = fgrp.wait(100);
+            let elapsed_us = before.elapsed().as_micros();
+
+            // Log first 5 waits, then every 100k
+            static WAIT_COUNT: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let count = WAIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count < 5 || count % 100000 == 0 {
+                info!(
+                    "fd_group_wait: {}us, {} events (call #{})",
+                    elapsed_us, rc, count,
+                );
+            }
         }
     }
 
