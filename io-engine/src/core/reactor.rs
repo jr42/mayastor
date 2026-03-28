@@ -179,7 +179,6 @@ impl Reactors {
             };
             assert_eq!(rc, 0);
 
-            let num_cores = Cores::count().into_iter().count();
             let interrupt_available = interrupt_mode
                 && spdk_rs::Thread::interrupt_mode_is_enabled();
 
@@ -187,19 +186,10 @@ impl Reactors {
                 Cores::count()
                     .into_iter()
                     .map(|core| {
-                        // For multi-core: enable interrupt on remote cores
-                        // only (master core uses tokio, can't block in epoll).
-                        // For single-core: enable on the master core too,
-                        // using a different waiting strategy in the Future impl.
-                        let core_interrupt = if num_cores == 1 {
-                            interrupt_available
-                        } else {
-                            interrupt_available && core != Cores::first()
-                        };
                         Reactor::new(
                             core,
                             developer_delay,
-                            core_interrupt,
+                            interrupt_available,
                             interrupt_idle_threshold,
                         )
                     })
@@ -731,12 +721,6 @@ impl Reactor {
         self.set_state(ReactorState::Interrupt);
     }
 
-    /// Enter interrupt mode on the master core (used in Future impl).
-    /// Does NOT change reactor state (caller manages state).
-    fn enter_interrupt_mode_for_master(&self) {
-        self.switch_threads_to_interrupt();
-    }
-
     /// Exit interrupt mode and return to Running state.
     fn exit_interrupt_mode(&self) {
         self.switch_threads_to_poll();
@@ -918,18 +902,7 @@ impl Future for &'static Reactor {
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         match self.get_state() {
             ReactorState::Running => {
-                if self.interrupt_enabled && self.epoll_fd >= 0 {
-                    // Single-core interrupt mode: poll, then sleep in
-                    // epoll_wait until events arrive. This blocks the
-                    // tokio thread briefly but avoids 100% CPU.
-                    self.poll_once();
-                    self.switch_threads_to_interrupt();
-                    self.wait_for_events();
-                    self.switch_threads_to_poll();
-                    self.poll_once();
-                } else {
-                    self.poll_times(3);
-                }
+                self.poll_times(3);
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
@@ -957,24 +930,9 @@ impl Future for &'static Reactor {
                 Poll::Pending
             }
             ReactorState::Interrupt => {
-                // Master core interrupt mode (single-core setup):
-                // Use a short epoll_wait to avoid busy-spinning while
-                // remaining responsive. This integrates with tokio by
-                // blocking briefly then re-scheduling ourselves.
-                if self.epoll_fd >= 0 {
-                    // Switch SPDK threads to interrupt mode, wait briefly
-                    // for events, then switch back and poll.
-                    self.enter_interrupt_mode_for_master();
-                    self.wait_for_events();
-                    self.exit_interrupt_mode();
-                    self.poll_once();
-                } else {
-                    // Fallback: just sleep briefly like Delayed mode.
-                    std::thread::sleep(Duration::from_millis(1));
-                    self.poll_once();
-                }
-                // Return to Running to re-evaluate on next poll.
-                self.set_state(ReactorState::Running);
+                // Interrupt state is handled by poll_reactor(), not here.
+                // Fall through to Running behavior for safety.
+                self.poll_times(3);
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
