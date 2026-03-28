@@ -573,6 +573,18 @@ impl Reactor {
                 // the master core spin within this specific loop
                 ReactorState::Running => {
                     if self.interrupt_enabled {
+                        // Log once on first entry
+                        static LOGGED: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            info!(
+                                "Core {}: entering interrupt-enabled poll loop \
+                                 (threshold={}, threads={})",
+                                self.lcore,
+                                self.idle_threshold,
+                                self.threads.borrow().len(),
+                            );
+                        }
                         let completions = self.poll_once_counted();
                         if self.idle_threshold == 0 {
                             // Always-interrupt: re-enter after every poll
@@ -667,10 +679,22 @@ impl Reactor {
     /// and register their interrupt fds in the epoll set.
     fn switch_threads_to_interrupt(&self) {
         let threads = self.threads.borrow();
+        let count = threads.len();
+        if count == 0 {
+            warn!(
+                "Core {}: no SPDK threads to switch to interrupt mode",
+                self.lcore,
+            );
+        }
 
         for t in threads.iter() {
             // set_interrupt_mode operates on the *current* SPDK thread,
             // so we must set each thread as current before calling it.
+            info!(
+                "Core {}: switching thread '{}' to interrupt mode",
+                self.lcore,
+                t.name(),
+            );
             t.set_current();
             spdk_rs::Thread::set_interrupt_mode(true);
 
