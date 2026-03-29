@@ -1,8 +1,10 @@
 use std::{os::raw::c_void, ptr::NonNull};
 
 use spdk_rs::libspdk::{
-    spdk_nvme_poll_group, spdk_nvme_poll_group_add, spdk_nvme_poll_group_create,
-    spdk_nvme_poll_group_destroy, spdk_nvme_poll_group_remove,
+    spdk_fd_group, spdk_nvme_poll_group, spdk_nvme_poll_group_add,
+    spdk_nvme_poll_group_create, spdk_nvme_poll_group_destroy,
+    spdk_nvme_poll_group_get_fd_group, spdk_nvme_poll_group_remove,
+    spdk_nvme_poll_group_set_interrupt_callback,
 };
 
 use crate::core::CoreError;
@@ -41,6 +43,33 @@ impl PollGroup {
     #[inline(always)]
     pub(super) fn as_ptr(&self) -> *mut spdk_nvme_poll_group {
         self.0.as_ptr()
+    }
+
+    /// Returns the fd_group associated with this poll group (for interrupt
+    /// mode fd_group nesting).
+    pub(super) fn get_fd_group(&self) -> *mut spdk_fd_group {
+        unsafe { spdk_nvme_poll_group_get_fd_group(self.0.as_ptr()) }
+    }
+
+    /// Registers the interrupt callback for non-completion events
+    /// (e.g. qpair disconnection).
+    pub(super) fn set_interrupt_callback(
+        &self,
+        cb_fn: Option<
+            unsafe extern "C" fn(
+                *mut spdk_nvme_poll_group,
+                *mut c_void,
+            ),
+        >,
+        cb_ctx: *mut c_void,
+    ) -> i32 {
+        unsafe {
+            spdk_nvme_poll_group_set_interrupt_callback(
+                self.0.as_ptr(),
+                cb_fn,
+                cb_ctx,
+            )
+        }
     }
 }
 

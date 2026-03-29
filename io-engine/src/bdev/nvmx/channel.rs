@@ -4,11 +4,12 @@ use std::{mem::size_of, os::raw::c_void, ptr::NonNull, time::Duration};
 
 use spdk_rs::{
     libspdk::{
-        nvme_qpair_abort_all_queued_reqs, nvme_transport_qpair_abort_reqs, spdk_io_channel,
-        spdk_nvme_poll_group_process_completions, spdk_nvme_qpair, spdk_nvme_qpair_set_abort_dnr,
-        spdk_put_io_channel,
+        nvme_qpair_abort_all_queued_reqs, nvme_transport_qpair_abort_reqs, spdk_interrupt,
+        spdk_interrupt_register_fd_group, spdk_interrupt_unregister, spdk_io_channel,
+        spdk_nvme_poll_group, spdk_nvme_poll_group_process_completions, spdk_nvme_qpair,
+        spdk_nvme_qpair_set_abort_dnr, spdk_put_io_channel,
     },
-    Poller, PollerBuilder,
+    Poller, PollerBuilder, Thread,
 };
 
 use crate::{
@@ -62,6 +63,8 @@ pub struct NvmeIoChannelInner<'a> {
     qpair: Option<QPair>,
     poll_group: PollGroup,
     poller: Poller<'a>,
+    /// Interrupt handle for fd_group nesting (null in polling mode).
+    intr: *mut spdk_interrupt,
     io_stats_controller: IoStatsController,
     pub device: Box<dyn BlockDevice>,
     /// to prevent the controller from being destroyed before the channel
@@ -308,6 +311,15 @@ extern "C" fn nvme_poll(ctx: *mut c_void) -> i32 {
     }
 }
 
+/// Interrupt callback for NVMe poll group non-completion events
+/// (e.g. qpair disconnection). Just polls completions.
+extern "C" fn nvme_poll_group_interrupt_cb(
+    _group: *mut spdk_nvme_poll_group,
+    ctx: *mut c_void,
+) {
+    nvme_poll(ctx);
+}
+
 impl NvmeControllerIoChannel {
     pub extern "C" fn create(device: *mut c_void, ctx: *mut c_void) -> i32 {
         let id = device as u64;
@@ -390,18 +402,62 @@ impl NvmeControllerIoChannel {
             return 1;
         }
 
-        // Create poller.
-        let poller = PollerBuilder::new()
-            .with_interval(Duration::from_micros(
-                nvme_bdev_running_config().nvme_ioq_poll_period_us,
-            ))
-            .with_poll_fn(move |_| nvme_poll(ctx))
-            .build();
+        // Create poller. In interrupt mode, use period=0 and deactivate
+        // the auto-created eventfd — interrupts come from the poll group's
+        // fd_group instead.
+        let interrupt_mode = Thread::interrupt_mode_is_enabled();
+        let poller = if interrupt_mode {
+            let poller = PollerBuilder::new()
+                .with_interval(Duration::from_micros(0))
+                .with_poll_fn(move |_| nvme_poll(ctx))
+                .build();
+            poller.register_interrupt_none();
+            poller
+        } else {
+            PollerBuilder::new()
+                .with_interval(Duration::from_micros(
+                    nvme_bdev_running_config().nvme_ioq_poll_period_us,
+                ))
+                .with_poll_fn(move |_| nvme_poll(ctx))
+                .build()
+        };
+
+        // In interrupt mode, nest the poll group's fd_group into the
+        // thread's fd_group so NVMe completion fds trigger wakeups.
+        let intr: *mut spdk_interrupt = if interrupt_mode {
+            let fgrp = poll_group.get_fd_group();
+            if fgrp.is_null() {
+                error!(?cname, "Failed to get poll group fd_group");
+                return 1;
+            }
+
+            let rc = poll_group.set_interrupt_callback(
+                Some(nvme_poll_group_interrupt_cb),
+                ctx,
+            );
+            if rc != 0 {
+                error!(?cname, ?rc, "Failed to set poll group interrupt callback");
+                return 1;
+            }
+
+            let name = std::ffi::CString::new("nvme_io_interrupt").unwrap();
+            let intr = unsafe {
+                spdk_interrupt_register_fd_group(fgrp, name.as_ptr())
+            };
+            if intr.is_null() {
+                error!(?cname, "Failed to register fd_group interrupt");
+                return 1;
+            }
+            intr
+        } else {
+            std::ptr::null_mut()
+        };
 
         let inner = Box::new(NvmeIoChannelInner {
             qpair: Some(qpair),
             poll_group,
             poller,
+            intr,
             io_stats_controller: IoStatsController::new(block_size),
             is_shutdown: false,
             device,
@@ -425,6 +481,13 @@ impl NvmeControllerIoChannel {
         {
             let ch = NvmeIoChannel::from_raw(ctx);
             let mut inner = unsafe { Box::from_raw(ch.inner) };
+
+            // Unregister fd_group interrupt before stopping poller.
+            if !inner.intr.is_null() {
+                unsafe {
+                    spdk_interrupt_unregister(&mut inner.intr);
+                }
+            }
 
             let qpair = inner.remove_qpair();
 
