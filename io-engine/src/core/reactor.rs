@@ -591,7 +591,14 @@ impl Reactor {
                     // fd_group_wait dispatches events to the registered
                     // interrupt callbacks (which are the poller functions).
                     self.wait_for_events();
-                    // Process Rust futures and incoming threads.
+                    // Restore init_thread context before running Rust
+                    // futures. fd_group_wait wrappers save/restore the
+                    // context for each event, but we set it explicitly
+                    // so gRPC futures see the app thread (required by
+                    // spdk_bdev_register and other app-thread-only APIs).
+                    if let Some(init_t) = self.threads.borrow().front() {
+                        init_t.set_current();
+                    }
                     self.receive_futures();
                     self.run_futures();
                     self.add_incoming();
@@ -658,6 +665,15 @@ impl Reactor {
             t.set_current();
             spdk_rs::Thread::set_interrupt_mode(true);
         }
+
+        // Restore init_thread (first thread) as the current SPDK thread.
+        // The loop above leaves the last thread as current, but Rust
+        // futures (gRPC handlers) need the app thread context —
+        // spdk_bdev_register() requires spdk_thread_is_app_thread().
+        if let Some(init_t) = threads.front() {
+            init_t.set_current();
+        }
+
         let count = threads.len();
         drop(threads);
 
