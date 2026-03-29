@@ -582,13 +582,10 @@ impl Reactor {
                 }
                 ReactorState::Interrupt => {
                     // Block until I/O events or wakeup from send_future.
-                    // fd_group_wait dispatches events to registered
-                    // callbacks internally (SPDK handles the I/O).
+                    // fd_group_wait dispatches events to the registered
+                    // interrupt callbacks (which are the poller functions).
                     self.wait_for_events();
-                    // Process Rust futures and incoming threads -- but
-                    // don't call spdk_thread_poll() since the thread
-                    // fd_groups are nested and already processed by
-                    // fd_group_wait.
+                    // Process Rust futures and incoming threads.
                     self.receive_futures();
                     self.run_futures();
                     self.add_incoming();
