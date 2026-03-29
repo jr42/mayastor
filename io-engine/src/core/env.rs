@@ -283,11 +283,6 @@ pub struct MayastorCliArgs {
     /// Warning: Experimental. NVMe-oF TCP targets only.
     #[clap(long = "enable-interrupt-mode", env = "ENABLE_INTERRUPT_MODE", value_parser = delay_compat)]
     pub interrupt_mode: bool,
-    /// Number of consecutive idle polls before switching to interrupt mode. {n}
-    /// Default 0 means always use interrupt mode (best for low-I/O workloads). {n}
-    /// Higher values (e.g. 1000) enable adaptive switching for mixed workloads.
-    #[clap(long = "interrupt-idle-threshold", env = "INTERRUPT_IDLE_THRESHOLD", default_value = "0")]
-    pub interrupt_idle_threshold: u64,
     /// Enables RDMA between initiator and Mayastor Nvmf target.
     #[clap(long = "enable-rdma", env = "ENABLE_RDMA", value_parser = delay_compat)]
     pub rdma: bool,
@@ -526,7 +521,6 @@ pub struct MayastorEnvironment {
     enable_io_all_thrd_nexus_channels: bool,
     developer_delay: bool,
     interrupt_mode: bool,
-    interrupt_idle_threshold: u64,
     rdma: bool,
     bs_cluster_unmap: bool,
     pub pool_args: PoolCliArgs,
@@ -579,7 +573,6 @@ impl Default for MayastorEnvironment {
             enable_io_all_thrd_nexus_channels: false,
             developer_delay: false,
             interrupt_mode: false,
-            interrupt_idle_threshold: 0,
             rdma: false,
             bs_cluster_unmap: false,
             pool_args: PoolCliArgs::default(),
@@ -724,7 +717,6 @@ impl MayastorEnvironment {
             skip_sig_handler: args.skip_sig_handler,
             developer_delay: args.developer_delay,
             interrupt_mode: args.interrupt_mode,
-            interrupt_idle_threshold: args.interrupt_idle_threshold,
             rdma: args.rdma,
             bs_cluster_unmap: args.bs_cluster_unmap,
             enable_io_all_thrd_nexus_channels: args.enable_io_all_thrd_nexus_channels,
@@ -1175,7 +1167,6 @@ impl MayastorEnvironment {
         Reactors::init(
             self.developer_delay,
             self.interrupt_mode,
-            self.interrupt_idle_threshold,
         );
 
         // launch the remote cores if any. note that during init these have to
