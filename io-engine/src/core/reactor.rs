@@ -339,10 +339,15 @@ impl Reactor {
                         libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)
                     };
                     if efd >= 0 {
-                        match fg.add(
+                        // Register as EVENTFD type so fd_group_wait()
+                        // auto-drains it. Without this, a single
+                        // send_future() write makes the fd permanently
+                        // readable (level-triggered), spinning the reactor.
+                        match fg.add_with_fd_type(
                             efd,
                             Self::wakeup_handler,
                             std::ptr::null_mut(),
+                            spdk_rs::FD_TYPE_EVENTFD,
                         ) {
                             Ok(()) => {
                                 wakeup_fd = efd;
@@ -386,10 +391,11 @@ impl Reactor {
         }
     }
 
-    /// Callback for the wakeup eventfd. Drains the eventfd counter.
+    /// Callback for the wakeup eventfd. The eventfd is auto-drained
+    /// by `fd_group_wait()` because it is registered as
+    /// `SPDK_FD_TYPE_EVENTFD`. The actual futures are processed by
+    /// `receive_futures()` in the poll loop.
     extern "C" fn wakeup_handler(_ctx: *mut c_void) -> i32 {
-        // Just drain the eventfd; the actual futures will be processed
-        // by receive_futures() in the poll loop.
         0
     }
 
