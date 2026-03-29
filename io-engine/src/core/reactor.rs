@@ -689,7 +689,15 @@ impl Reactor {
     /// nested thread fd_groups.
     fn wait_for_events(&self) {
         if let Some(fgrp) = &self.fgrp {
-            fgrp.wait(-1); // block forever until events
+            let before = std::time::Instant::now();
+            let rc = fgrp.wait(-1);
+            let elapsed_us = before.elapsed().as_micros();
+            static COUNT: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 5 || n % 100000 == 0 {
+                info!("fd_group_wait: {}us, {} events (#{n})", elapsed_us, rc);
+            }
         }
     }
 
