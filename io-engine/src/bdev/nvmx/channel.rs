@@ -402,11 +402,21 @@ impl NvmeControllerIoChannel {
             return 1;
         }
 
-        // Create poller. In interrupt mode, use period=0 and deactivate
-        // the auto-created eventfd — interrupts come from the poll group's
-        // fd_group instead.
-        let interrupt_mode = Thread::interrupt_mode_is_enabled();
-        let poller = if interrupt_mode {
+        // Check if fd_group nesting is enabled via env var.
+        // When enabled, the NVMe I/O poller uses interrupt-driven
+        // completions via the poll group's fd_group instead of a
+        // periodic timerfd. Gated because it currently causes ENXIO
+        // on NVMe-oF TCP qpair connect (under investigation).
+        let use_fd_group_nesting = Thread::interrupt_mode_is_enabled()
+            && std::env::var("NVME_FD_GROUP_NESTING")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false);
+
+        // Create poller. With fd_group nesting, use period=0 and
+        // deactivate the auto-created eventfd — interrupts come from
+        // the poll group's fd_group instead. Without, use the
+        // configured poll period (NVME_IOQ_POLL_PERIOD).
+        let poller = if use_fd_group_nesting {
             let poller = PollerBuilder::new()
                 .with_interval(Duration::from_micros(0))
                 .with_poll_fn(move |_| nvme_poll(ctx))
@@ -422,9 +432,9 @@ impl NvmeControllerIoChannel {
                 .build()
         };
 
-        // In interrupt mode, nest the poll group's fd_group into the
-        // thread's fd_group so NVMe completion fds trigger wakeups.
-        let intr: *mut spdk_interrupt = if interrupt_mode {
+        // With fd_group nesting, nest the poll group's fd_group into
+        // the thread's fd_group so NVMe completion fds trigger wakeups.
+        let intr: *mut spdk_interrupt = if use_fd_group_nesting {
             let fgrp = poll_group.get_fd_group();
             if fgrp.is_null() {
                 error!(?cname, "Failed to get poll group fd_group");
