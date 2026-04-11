@@ -222,6 +222,14 @@ impl Reactors {
                     r.lcore,
                 );
                 r.incoming.push(mt);
+                // Wake the target reactor if it's another core sitting
+                // in fd_group_wait — it can't drain `incoming` until it
+                // returns from the blocking wait. Without this kick a
+                // slave reactor that entered interrupt mode with zero
+                // threads would never see threads scheduled to it later.
+                if r.lcore != Cores::current() {
+                    r.wake();
+                }
                 return true;
             }
             false
@@ -728,8 +736,53 @@ impl Reactor {
     }
 
     fn add_incoming(&self) {
+        // Only nest if the reactor has actually transitioned into
+        // Interrupt state. Reactors that are still busy-polling
+        // (e.g. the master core, which is driven by Future::poll
+        // and never calls enter_interrupt_mode) must NOT have
+        // their threads' fgrps nested — spdk_thread_poll on those
+        // threads would then hit a nested fgrp and warn / no-op.
+        let nest_into_fgrp = (self.get_state() == ReactorState::Interrupt)
+            .then_some(self.fgrp.as_ref())
+            .flatten();
+
         while let Some(i) = self.incoming.pop() {
+            if let Some(fgrp) = nest_into_fgrp {
+                let thread_fgrp = i.get_interrupt_fd_group();
+                if !thread_fgrp.is_null() {
+                    if let Err(rc) = fgrp.nest(thread_fgrp) {
+                        warn!(
+                            "add_incoming: failed to nest thread '{}' fd_group on core {} (rc={})",
+                            i.name(),
+                            self.lcore,
+                            rc,
+                        );
+                    } else {
+                        info!(
+                            "add_incoming: nested thread '{}' fd_group on core {}",
+                            i.name(),
+                            self.lcore,
+                        );
+                    }
+                }
+            }
             self.threads.borrow_mut().push_back(i);
+        }
+    }
+
+    /// Wake the reactor if it's blocked in fd_group_wait. Used by
+    /// schedule() so a slave reactor sleeping with no threads gets
+    /// kicked when one is added.
+    fn wake(&self) {
+        if self.wakeup_fd >= 0 {
+            let val: u64 = 1;
+            unsafe {
+                libc::write(
+                    self.wakeup_fd,
+                    &val as *const u64 as *const libc::c_void,
+                    std::mem::size_of::<u64>(),
+                );
+            }
         }
     }
 
