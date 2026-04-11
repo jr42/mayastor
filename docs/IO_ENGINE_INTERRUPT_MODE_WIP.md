@@ -270,18 +270,18 @@ kubectl -n openebs patch ds openebs-io-engine --type=json -p='[
 kubectl -n openebs delete pod <talos3-pod>
 ```
 
-## Current Status
+## Earlier Work (2026-03-29)
 
-**Root cause identified (2026-03-29)**: The spinning was caused by
-eventfds registered as `SPDK_FD_TYPE_DEFAULT` instead of
-`SPDK_FD_TYPE_EVENTFD`. The distinction is critical:
+Initial investigation found the reactor was busy-spinning because some
+eventfds were registered as `SPDK_FD_TYPE_DEFAULT` instead of
+`SPDK_FD_TYPE_EVENTFD`. The distinction:
 
 - `SPDK_FD_TYPE_EVENTFD`: `fd_group_wait()` auto-drains the eventfd
   (reads the counter to 0) before calling the callback. Next
   `epoll_wait` correctly blocks.
 - `SPDK_FD_TYPE_DEFAULT`: `fd_group_wait()` calls the callback but
-  does NOT drain the fd. Since eventfds are level-triggered, they
-  stay readable forever, making `epoll_wait` return on every call.
+  does NOT drain the fd. Level-triggered eventfds then stay readable
+  forever, making `epoll_wait` return on every call.
 
 The draining logic is in `fd_group.c:661`:
 ```c
@@ -289,67 +289,216 @@ if (ehdlr->fd_type == SPDK_FD_TYPE_EVENTFD) {
     bytes_read = read(ehdlr->fd, &count, sizeof(count));
 ```
 
-**Two independent bugs, same root cause:**
+Two distinct fds were miscategorised:
 
-1. **Reactor wakeup_fd** (reactor.rs): Registered via `spdk_fd_group_add`
-   which defaults to `DEFAULT`. After `send_future()` writes 1, the
-   eventfd is never drained → `epoll_wait` returns instantly forever.
-   The reactor_monitor_loop sends heartbeats via `send_future()` every
-   1 second, triggering permanent spinning within 1s of boot.
-   SPDK's own `reactor.c:1503` uses `SPDK_FD_TYPE_EVENTFD` for its
-   equivalent eventfd — we missed this.
+1. **Reactor wakeup_fd** (`reactor.rs`) — registered via `spdk_fd_group_add`
+   which defaults to `DEFAULT`. Fix: `add_with_fd_type(efd, …, FD_TYPE_EVENTFD)`.
+2. **Busy poller eventfds** (SPDK `thread.c`) — registered via
+   `spdk_interrupt_register` which also defaults to `DEFAULT`. Fix:
+   `spdk_interrupt_register_ext(efd, …, &opts)` with
+   `opts.fd_type = SPDK_FD_TYPE_EVENTFD`.
 
-2. **Busy poller eventfds** (thread.c): Registered via
-   `spdk_interrupt_register` → `spdk_interrupt_register_for_events`
-   which sets `SPDK_FD_TYPE_DEFAULT` (line 2883). When
-   `busy_poller_set_interrupt_mode(true)` writes 1 to the eventfd,
-   it stays permanently readable. The comment at line 1607 even says:
-   "Write without read on eventfd will get it repeatedly triggered."
+**These two fixes were necessary but not sufficient.** They got the
+reactor into interrupt mode without busy-spinning, but broader testing
+(2026-04-11) revealed that the resulting build is still broken in
+several ways — see below.
 
-**What was NOT the cause** (these already work correctly):
-- Thread `msg_fd`: registered as `SPDK_FD_TYPE_EVENTFD` (line 2831) → auto-drained
-- Timed pollers: callback `interrupt_timerfd_process` reads the timerfd (line 1471)
-- NVMf/NVMe bdev pollers: call `register_interrupt(NULL, NULL)` → removed from fd_group
+## Reality Check (2026-04-11)
 
-**Fix applied**: Changed both registrations to use `SPDK_FD_TYPE_EVENTFD`:
-- reactor.rs: `fg.add_with_fd_type(efd, ..., FD_TYPE_EVENTFD)`
-- thread.c: `spdk_interrupt_register_ext(efd, ..., &opts)` with `opts.fd_type = SPDK_FD_TYPE_EVENTFD`
+Comprehensive end-to-end testing with a docker-compose + pytest harness
+on a Colima x86_64/aarch64 VM. Drove io-engine directly via
+`io-engine-client` gRPC calls and via `test/python/tests/publish/test_nexus_publish.py`.
 
-**Previous attempts that failed and why**:
-1. Raw epoll on thread interrupt fds — wrong mechanism, not how SPDK works
-2. fd_group_wait(100ms) — eventfds always hot (DEFAULT type, never drained)
-3. Suppress all pollers with register_interrupt(NULL,NULL) — disabled
-   Mayastor's own pollers that have no separate interrupt fds
-4. Call poll_once()/spdk_thread_poll() after fd_group_wait — nested
-   fd_group warning, and redundant since fd_group_wait dispatches work
-5. fd_group_wait(-1) with no poll_once — correct reactor pattern but
-   eventfds registered as DEFAULT type were never drained
+### What works
 
-## Key Insights
+- `ENABLE_INTERRUPT_MODE=true NVME_IOQ_POLL_PERIOD=1000us`
+  on a **single-core** io-engine (`-l 1`) starts cleanly: reactor enters
+  interrupt mode, NVMf TCP target comes up, gRPC server listens,
+  `fd_group_wait` loop runs with ~4 ms cadence, `bdev create`/`bdev share`/
+  `nexus create` all complete in ~100 ms.
+- Pure polling mode (no interrupt-mode env vars) passes all 15 tests of
+  `test_nexus_publish.py` in ~4 s — the parent branch is functional for
+  polling, baseline holds.
 
-1. SPDK's fd_group_wait IS the work executor in interrupt mode. It calls
-   poller callbacks directly via the interrupt dispatch mechanism. The
-   reactor should NOT call spdk_thread_poll() in interrupt mode.
+### What doesn't (confirmed bugs on `feat/interrupt-mode`, not just the WIP tip)
 
-2. **fd_group_wait only auto-drains `SPDK_FD_TYPE_EVENTFD` fds.**
-   Fds registered as `SPDK_FD_TYPE_DEFAULT` (the default from
-   `spdk_fd_group_add` and `spdk_interrupt_register`) are dispatched
-   but NEVER drained. Since eventfds are level-triggered, an undrained
-   eventfd with counter > 0 causes `epoll_wait` to return it on every
-   call — a permanent busy-spin.
+1. **Multi-core interrupt mode deadlocks at init.**
+   With `-l 1,2` (or `-l 3,4`, or `-l 1,2,3`) plus
+   `ENABLE_INTERRUPT_MODE=true`, every reactor enters interrupt mode
+   and schedules its NVMx/NVMf threads, then init_thread fires a single
+   `fd_group_wait` and goes silent forever. gRPC server is never
+   configured. Reproduced on both the aarch64 fresh build and the
+   published x86_64 `ghcr.io/jr42/mayastor-io-engine:interrupt-mode`
+   image under Rosetta. Hits `feat/interrupt-mode` and
+   `feat/interrupt-mode-fdgroup-wip` identically. **Prod (`-l3`, single
+   core) masks this entirely.**
 
-3. SPDK's own reactor (`reactor.c:1503`) registers its eventfds as
-   `SPDK_FD_TYPE_EVENTFD`. Any custom reactor code must do the same.
+2. **Nexus destroy hangs indefinitely in single-core interrupt mode.**
+   Direct `io-engine-client` reproducer, no pytest involved:
+   ```
+   bdev create malloc:///test0?size_mb=16&blk_size=4096   # OK, ~50 ms
+   nexus create … 16MiB bdev:///test0                     # OK, ~50 ms
+   nexus destroy …                                         # hangs forever
+   ```
+   Logs show the destroy reaches `all children closed` (nexus_bdev_children.rs:447)
+   and then nothing. The nexus stays in `faulted` state, its bdev
+   remains orphaned. The reactor is still alive — other gRPC calls
+   (`nexus list`, `bdev list`) respond instantly — but the
+   `DestroyNexus` future never wakes. Same behaviour with a multi-child
+   nexus (bdev + nvmf), or with the pytest harness's 4-child nexus
+   (bdev + nvmf + aio + uring). **The stuck point is between
+   `all children closed` and the next expected log line
+   `nexus destroyed ok` (nexus_bdev.rs:863)** — most likely inside
+   `unregister_bdev_async()` in `spdk-rs/src/bdev_async.rs:101-124`
+   waiting on the oneshot from `inner_unregister_callback`, which in
+   turn depends on an SPDK bdev-layer poller that isn't firing. Not
+   narrowed to an exact line yet.
 
-4. Timed pollers work correctly because their callback
-   (`interrupt_timerfd_process`) explicitly reads the timerfd. Busy
-   pollers do NOT — they rely on the fd_type to drain them.
+3. **fd_group nesting (the WIP tip, commits `80432c79` + `9b4ba776`)
+   produces ENXIO on NVMe-oF TCP I/O qpair connect.**
+   `nvme_tcp.c:2341: Failed to construct the tqpair via correct icresp`
+   fires after `icreq_timeout_tsc` expires. Root cause: the nesting
+   code sets the NVMe I/O channel's poller to `period=0` +
+   `register_interrupt_none()`, expecting events from the nested NVMe
+   poll group fd_group. But that fd_group is empty for TCP qpairs
+   because SPDK `nvme_poll_group_add_qpair_fd()` short-circuits on
+   `group->enable_interrupts == false`, which in turn is captured from
+   `qpair->ctrlr->opts.enable_interrupts`, which SPDK (through v26.01
+   upstream) explicitly refuses to set for non-PCIe transports
+   (`bdev_nvme.c:6770-6778` and the TCP transport ops struct at
+   `nvme_tcp.c:2993` has no `.qpair_get_fd` entry at all).
+   Admin qpair is unaffected because it's driven by a separate timerfd
+   poller (`nvmx_poll_adminq_N`). Only I/O qpairs break.
 
-5. Thread `msg_fd` is registered as `SPDK_FD_TYPE_EVENTFD` (line 2831)
-   and works correctly. Messages are processed by
-   `thread_interrupt_msg_process` via `msg_queue_run_batch`.
+### Upstream status (checked 2026-04-11)
 
-6. The NVMe I/O channel poller (channel.rs) has period=0 (busy poller).
-   After fix #2, its eventfd fires once on mode entry then goes dormant.
-   Actual NVMe I/O is handled by the NVMf TCP transport's separately
-   registered interrupt fds.
+- v24.09: NVMe-oF TCP interrupt mode **target-side**
+- v25.05: NVMe driver interrupt mode **PCIe only**
+- v25.09: nothing relevant
+- v26.01 (latest release): **NVMe target RDMA** interrupt mode
+- master (v26.05.0-pre): still no TCP initiator `.qpair_get_fd`,
+  still has the PCIe-only gate
+
+**No upstream SPDK release has NVMe driver (initiator) interrupt mode
+for TCP.** SPDK issue #3443 was about PCIe (Samsung, completed);
+Dell's nvmf/tcp work in the issue body refers to target-side. A
+client-side TCP interrupt patch is not on any release track I can find.
+
+## Revised Goal — Port the Longhorn Approach
+
+Longhorn v2 shipped "interrupt mode" for their SPDK-based data engine
+in Longhorn 1.10 (LEP dated 2025-07-21,
+`longhorn/longhorn/enhancements/20250721-v2-engine-interrupt-mode.md`).
+Their explicit design, verbatim:
+
+> In the initial phase, interrupt mode will be implemented for the
+> SPDK NVMe/TCP transport using a **hybrid approach**:
+> - The NVMe-oF **target** will use `epoll` to wait for socket
+>   readiness events.
+> - The NVMe-oF **initiator** will continue to poll periodically to
+>   flush I/O completions.
+
+Concretely:
+
+- **Enable SPDK global interrupt mode** (`spdk_interrupt_mode_enable`
+  + thread `set_interrupt_mode(true)`) so the reactor blocks in
+  `fd_group_wait` and the NVMf target runs fully event-driven via the
+  sock-group epoll fd.
+- **Keep the NVMe I/O channel poller as a timerfd** with
+  `nvme_ioq_poll_period_us > 0` (default `100`). Do NOT call
+  `register_interrupt_none()` on it. Do NOT nest the poll-group
+  fd_group. The NVMe initiator stays "polled" — just at a
+  human-scale cadence instead of busy-spinning.
+- **Keep the NVMe admin poller** at its current periodic cadence so
+  keep-alives still fire.
+- Longhorn parks the "truly event-driven initiator" path as
+  "future investigate" — they explicitly chose not to wire
+  `spdk_sock_group_register_interrupt` into the NVMe TCP poll group,
+  because upstream SPDK's NVMe driver layer doesn't plumb socket fds
+  through to the NVMe poll group's fd_group for TCP.
+
+Longhorn's benchmark data (t2.2xlarge, 8 vCPU, 3x gp2 EBS): interrupt
+mode at `1000` µs poll period hits **9077 random read IOPS** vs. 6996
+for busy polling — the 1 ms timerfd initiator actually outperforms
+busy polling on random I/O because batching benefits amortise over the
+wait. Sequential read bandwidth still favours busy polling
+(370 vs 248 MiB/s). Our homelab workload is nearly all random I/O, so
+the trade is strongly positive.
+
+### Concrete action items for porting
+
+1. **Revert commits `80432c79` (fd_group nesting) and `9b4ba776` (env
+   var gate)** from `feat/interrupt-mode-fdgroup-wip`. The nesting
+   approach is architecturally incompatible with TCP as long as
+   upstream SPDK doesn't expose TCP socket fds through the NVMe
+   driver layer. Do not carry them.
+
+2. **Fix the `feat/interrupt-mode` nexus-destroy hang.** This is the
+   blocker for "interrupt mode actually working end-to-end." Narrow
+   the stuck point between `nexus_bdev_children.rs:447` and
+   `nexus_bdev.rs:863`, probably inside `unregister_bdev_async`.
+   Likely a missing poller interrupt registration in the same style
+   as the existing `bdev_wait_for_examine_cb` fix in
+   `spdk-fork/lib/bdev/bdev.c`, or an SPDK bdev-mgmt callback that
+   isn't wired to any fd event.
+
+3. **Fix the multi-core reactor init deadlock.** First `fd_group_wait`
+   on init_thread fires once, then the reactor stops responding.
+   Other SPDK interrupt mode consumers (Longhorn's `spdk_tgt`) use
+   SPDK's own reactor directly and apparently don't hit this — so the
+   bug is probably specific to our `reactor.rs` wrapper's handling of
+   cross-core wake-up or nested fd_group setup. Prod workaround
+   `-l3` is fine for now but it blocks multi-core evaluation.
+
+4. **Add a proper regression test suite** for interrupt mode. The
+   `test/python/tests/publish/` suite is the right shape, plus
+   `rebuild/`, `replica/`, `nexus_fault/`. All of these need to pass
+   with `ENABLE_INTERRUPT_MODE=true NVME_IOQ_POLL_PERIOD=1000us` on a
+   single-core io-engine before we can say "interrupt mode works."
+   Today, none of them do.
+
+5. **Drop `NVME_FD_GROUP_NESTING` env var** entirely — it only gates
+   dead code after the revert.
+
+## Open Questions
+
+- **Exact stuck point of nexus destroy in interrupt mode.** Known to
+  be between `all children closed` (nexus_bdev_children.rs:447) and
+  `nexus destroyed ok` (nexus_bdev.rs:863). Narrowed further: 30–60
+  minutes of instrumented rebuild loops in the Colima harness will
+  identify whether it's `persist`, `ptpl().destroy()`, or
+  `unregister_bdev_async`. Strong suspect: `unregister_bdev_async`
+  waiting on the oneshot callback, because the underlying SPDK
+  `spdk_bdev_unregister` depends on a bdev-mgmt poller that may not
+  be interrupt-registered.
+
+- **Multi-core deadlock root cause.** Happens before gRPC comes up,
+  so we can't query state. Needs source-level debugging of
+  `enter_interrupt_mode` in `reactor.rs` and cross-core thread
+  scheduling. Question: does SPDK's stock reactor loop handle
+  multi-core interrupt mode correctly? If yes, can we use it
+  directly? If no, what does Longhorn's spdk_tgt do differently?
+
+- **Does Longhorn v2 actually run multi-core in production?** Their
+  LEP doesn't specify. Their architecture typically runs one
+  `instance-manager` pod per disk/node, and the SPDK reactor CPU
+  mask is configurable but often defaults to a single core. Worth
+  checking their helm values / issue tracker before assuming
+  "Longhorn works multi-core."
+
+- **Is mayastor's custom `reactor.rs` wrapper necessary?**
+  Longhorn uses `spdk_tgt` directly. Mayastor wraps SPDK's thread
+  and reactor layer in its own Rust structures for lifecycle reasons.
+  If the wrapper is the source of the multi-core bug, the fix may
+  be smaller than a full rewrite: align the wrapper's `enter_interrupt_mode`
+  with what SPDK's `reactor.c:reactor_interrupt_run` does. But this
+  needs a careful diff first.
+
+- **Does prod really work?** Single-core prod (`-l3`) has been running
+  interrupt mode for 12+ days without apparent issues. But now that
+  we know `nexus destroy` hangs indefinitely in interrupt mode, we
+  should assume any volume delete / HA failover / controlled teardown
+  in prod is silently hanging and being masked by control-plane
+  retries/timeouts. This may be the same family of bugs as the HA
+  republish issue documented in `docs/MAYASTOR_HA.md`. Worth
+  cross-checking.
