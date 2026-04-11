@@ -1164,10 +1164,7 @@ impl MayastorEnvironment {
         }
 
         // allocate a Reactor per core
-        Reactors::init(
-            self.developer_delay,
-            self.interrupt_mode,
-        );
+        Reactors::init(self.developer_delay, self.interrupt_mode);
 
         // launch the remote cores if any. note that during init these have to
         // be running as during setup cross call will take place.

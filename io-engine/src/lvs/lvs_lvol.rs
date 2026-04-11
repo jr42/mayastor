@@ -379,7 +379,7 @@ impl Lvol {
                 }
             }
 
-            let sl = std::slice::from_raw_parts(val as *const u8, size as usize);
+            let sl = std::slice::from_raw_parts(val.cast::<u8>(), size as usize);
             std::str::from_utf8(sl).map_or_else(
                 |error| {
                     warn!(

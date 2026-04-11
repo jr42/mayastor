@@ -34,8 +34,7 @@ use std::{
     collections::VecDeque,
     fmt::{self, Debug, Display, Formatter},
     future::Future,
-    os::fd::RawFd,
-    os::raw::c_void,
+    os::{fd::RawFd, raw::c_void},
     pin::Pin,
     slice::Iter,
     time::Duration,
@@ -143,10 +142,7 @@ thread_local! {
 
 impl Reactors {
     /// initialize the reactor subsystem for each core assigned to us
-    pub fn init(
-        developer_delay: bool,
-        interrupt_mode: bool,
-    ) {
+    pub fn init(developer_delay: bool, interrupt_mode: bool) {
         REACTOR_LIST.get_or_init(|| {
             let mempool_sz = try_from_env(
                 "SPDK_DEFAULT_MSG_MEMPOOL_SIZE",
@@ -318,11 +314,7 @@ impl<'a> IntoIterator for &'a Reactors {
 
 impl Reactor {
     /// create a new ['Reactor'] instance
-    fn new(
-        core: u32,
-        developer_delay: bool,
-        interrupt_enabled: bool,
-    ) -> Self {
+    fn new(core: u32, developer_delay: bool, interrupt_enabled: bool) -> Self {
         // create a channel to receive futures on
         let (sx, rx) = unbounded::<Pin<Box<dyn Future<Output = ()> + 'static>>>();
 
@@ -335,9 +327,7 @@ impl Reactor {
                     // Create an eventfd and register it in the reactor's
                     // fd_group so send_future() can wake us from
                     // fd_group_wait().
-                    let efd = unsafe {
-                        libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)
-                    };
+                    let efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
                     if efd >= 0 {
                         // Register as EVENTFD type so fd_group_wait()
                         // auto-drains it. Without this, a single
@@ -355,10 +345,7 @@ impl Reactor {
                                 fgrp = Some(fg);
                             }
                             Err(rc) => {
-                                error!(
-                                    "Failed to add wakeup eventfd to fd_group (rc={})",
-                                    rc,
-                                );
+                                error!("Failed to add wakeup eventfd to fd_group (rc={})", rc,);
                                 unsafe { libc::close(efd) };
                             }
                         }
@@ -656,10 +643,7 @@ impl Reactor {
             let thread_fgrp = t.get_interrupt_fd_group();
             if !thread_fgrp.is_null() {
                 if let Err(rc) = fgrp.nest(thread_fgrp) {
-                    warn!(
-                        "Failed to nest thread '{}' fd_group (rc={})",
-                        t.name(), rc,
-                    );
+                    warn!("Failed to nest thread '{}' fd_group (rc={})", t.name(), rc,);
                 }
             }
             t.set_current();
@@ -714,8 +698,7 @@ impl Reactor {
             let before = std::time::Instant::now();
             let rc = fgrp.wait(-1);
             let elapsed_us = before.elapsed().as_micros();
-            static COUNT: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
+            static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 5 || n % 100000 == 0 {
                 info!("fd_group_wait: {}us, {} events (#{n})", elapsed_us, rc);
