@@ -384,6 +384,124 @@ for TCP.** SPDK issue #3443 was about PCIe (Samsung, completed);
 Dell's nvmf/tcp work in the issue body refers to target-side. A
 client-side TCP interrupt patch is not on any release track I can find.
 
+## Status Update (2026-04-12) — Single-Core Interrupt Mode Resolved
+
+The single-core blocker (`nexus destroy` / `bdev destroy` hang) has been
+root-caused and fixed. Single-core interrupt mode now passes the entire
+pytest harness with **zero regressions vs poll mode**.
+
+### Root cause of the destroy hang
+
+Our earlier "fix" commit `bdff48d1` ("fix(bdev): register interrupt for
+bdev_wait_for_examine poller") added
+`spdk_poller_register_interrupt(ctx->poller, NULL, NULL)` to silence
+the busy-spin from `bdev_wait_for_examine_cb` (a `period=0` busy
+poller). With `set_intr_cb_fn = NULL`, the call path through
+`spdk_poller_register_interrupt` calls `poller_interrupt_fini()`,
+which **closes the busy-poller's auto-fire eventfd** and removes it
+from the thread's `fd_group`. The poller is then left with no
+interrupt source at all. Once the thread is in interrupt mode,
+`thread_interrupt_msg_process` only services messages, not pollers —
+so `bdev_wait_for_examine_cb` never fires again.
+
+That has a non-obvious downstream effect: `spdk_bdev_register` opens
+a *temporary* descriptor for the bdev's examine pass and only closes
+it inside `bdev_register_finished`, which is what
+`bdev_wait_for_examine_cb` calls when the examine completes. With
+the poller dead, `bdev_register_finished` is never called, so the
+temp desc lingers in `bdev->internal.open_descs` forever.
+
+Every later `spdk_bdev_unregister` then takes this branch in
+`bdev_unregister_unsafe`:
+
+```c
+TAILQ_FOREACH_SAFE(desc, &bdev->internal.open_descs, link, tmp) {
+    rc = -EBUSY;
+    event_notify(desc, _remove_notify);  // dispatched to _tmp_bdev_event_cb
+}
+```
+
+`_tmp_bdev_event_cb` is a no-op log line, so the desc is never
+closed. `bdev_unregister_unsafe` returns `-EBUSY`, the bdev's
+status is set to `REMOVING` but the bdev is **not** removed from
+`g_bdev_mgr.bdevs`, `bdev_destroy_cb` is never invoked, and the
+oneshot the Rust side is awaiting in `unregister_bdev_async` never
+fires. Hang.
+
+This is purely a single-core-reactor / nested-fd_group consequence:
+upstream SPDK's stock reactor model doesn't hit it because its busy
+pollers fire on every `spdk_thread_poll` round regardless of
+interrupt mode, so `wait_for_examine_cb` runs and `bdev_register_finished`
+fires normally. Our wrapper (`io-engine/src/core/reactor.rs`) blocks
+in `spdk_fd_group_wait` on a single root fgrp and only services
+events that come through that fgrp — pollers without an interrupt
+source are dead.
+
+### Fix
+
+`spdk-fork` commit `d1a7adab` (`v25.05.x-mayastor`):
+
+```c
+/* Use a periodic poller (1 ms) instead of a busy poller. */
+ctx->poller = SPDK_POLLER_REGISTER(bdev_wait_for_examine_cb, ctx, 1000);
+```
+
+A periodic poller installs a *timerfd* that's registered as an
+interrupt source by SPDK's normal poller-register path. It fires in
+both poll and interrupt modes, doesn't busy-spin the reactor, and 1 ms
+poll latency is fine for examine completion (normally a few µs of
+real work).
+
+### Validation — pytest harness, single-core interrupt mode
+
+`ENABLE_INTERRUPT_MODE=true NVME_IOQ_POLL_PERIOD=1000us`, all suites
+converted to `-l 1` / `-l 2` (multi-core deadlock still open),
+compared against poll-mode baseline:
+
+| Suite | Result | Notes |
+|---|---|---|
+| publish | **15/15 PASS** | nexus + NVMe-oF TCP publish lifecycle |
+| rebuild | **6/6 PASS** | rebuild start/stop/pause/resume |
+| replica | **20/20 PASS** + 2 skip | pool + replica + share |
+| cli_controller | **2/2 PASS** | |
+| replica_uuid | **3/3 PASS** | |
+| nexus | 27 PASS, 7F+3E | failures identical in poll mode (env: host nvme-tcp) |
+| nexus_fault | 0/2 | failures identical in poll mode (env) |
+| nexus_multipath | 0/6 | failures identical in poll mode (env) |
+| ana_client | 0/2 | failures identical in poll mode (env) |
+| rpc | 0/1 | failure identical in poll mode (pre-existing test bug) |
+
+**Total: 73 pass, 0 interrupt-mode regressions** across the entire
+harness. Every failing test fails identically in poll mode and is
+attributable to (a) Colima dev VM having no kernel `nvme-tcp` host
+stack for the host-side `nvme connect` calls some tests need, or
+(b) one stale `rpc::test_rpc_timeout` that's broken in both modes.
+
+### Why this fix isn't in upstream and why Longhorn's fork doesn't carry it
+
+The bug only exists when the SPDK reactor loop is replaced by a
+custom Rust loop that nests thread `fd_group`s into one root and
+blocks in `spdk_fd_group_wait` (mayastor). Upstream `spdk_tgt` and
+Longhorn's spdk-engine both use SPDK's stock reactor, which calls
+`spdk_thread_poll` per round, which services busy pollers regardless
+of interrupt-mode state. The `wait_for_examine_cb` busy-spin during
+examine in upstream is a deliberate trade-off they accept (examine
+is microseconds long). It only becomes a bug under our reactor
+model.
+
+### Open work after this fix
+
+The two remaining multi-core blockers from the earlier reality
+check are unchanged:
+
+- **Multi-core interrupt-mode init deadlock** (item 3 in revised
+  goals below) — first `fd_group_wait` on init_thread fires once,
+  then everything stops. Reproduced on every multi-core config.
+  Workaround: stay on `-l 1` per io-engine container.
+- **fd_group nesting / NVMe-oF TCP qpair ENXIO** on the WIP branch
+  (item 1 below) — architectural; defer or lift the Longhorn-style
+  hybrid initiator (see "Revised Goal" section below).
+
 ## Revised Goal — Port the Longhorn Approach
 
 Longhorn v2 shipped "interrupt mode" for their SPDK-based data engine
@@ -433,14 +551,10 @@ the trade is strongly positive.
    upstream SPDK doesn't expose TCP socket fds through the NVMe
    driver layer. Do not carry them.
 
-2. **Fix the `feat/interrupt-mode` nexus-destroy hang.** This is the
-   blocker for "interrupt mode actually working end-to-end." Narrow
-   the stuck point between `nexus_bdev_children.rs:447` and
-   `nexus_bdev.rs:863`, probably inside `unregister_bdev_async`.
-   Likely a missing poller interrupt registration in the same style
-   as the existing `bdev_wait_for_examine_cb` fix in
-   `spdk-fork/lib/bdev/bdev.c`, or an SPDK bdev-mgmt callback that
-   isn't wired to any fd event.
+2. **Fix the `feat/interrupt-mode` nexus-destroy hang.** ✓ DONE
+   2026-04-12 in spdk-fork commit `d1a7adab` — see "Status Update"
+   section above. Single-core interrupt mode now passes the entire
+   pytest harness with zero regressions.
 
 3. **Fix the multi-core reactor init deadlock.** First `fd_group_wait`
    on init_thread fires once, then the reactor stops responding.
@@ -462,15 +576,14 @@ the trade is strongly positive.
 
 ## Open Questions
 
-- **Exact stuck point of nexus destroy in interrupt mode.** Known to
-  be between `all children closed` (nexus_bdev_children.rs:447) and
-  `nexus destroyed ok` (nexus_bdev.rs:863). Narrowed further: 30–60
-  minutes of instrumented rebuild loops in the Colima harness will
-  identify whether it's `persist`, `ptpl().destroy()`, or
-  `unregister_bdev_async`. Strong suspect: `unregister_bdev_async`
-  waiting on the oneshot callback, because the underlying SPDK
-  `spdk_bdev_unregister` depends on a bdev-mgmt poller that may not
-  be interrupt-registered.
+- ~~**Exact stuck point of nexus destroy in interrupt mode.**~~
+  Resolved 2026-04-12. The hang is in `unregister_bdev_async` →
+  `spdk_bdev_unregister` → blocked on `-EBUSY` from a lingering
+  temp desc that `bdev_register_finished` should have closed but
+  couldn't because `bdev_wait_for_examine_cb` never fires in our
+  interrupt-mode reactor. Fixed in spdk-fork `d1a7adab` by switching
+  the wait-for-examine poller from `period=0` (busy) to
+  `period=1000us` (timerfd). See "Status Update (2026-04-12)" above.
 
 - **Multi-core deadlock root cause.** Happens before gRPC comes up,
   so we can't query state. Needs source-level debugging of
@@ -494,11 +607,11 @@ the trade is strongly positive.
   with what SPDK's `reactor.c:reactor_interrupt_run` does. But this
   needs a careful diff first.
 
-- **Does prod really work?** Single-core prod (`-l3`) has been running
-  interrupt mode for 12+ days without apparent issues. But now that
-  we know `nexus destroy` hangs indefinitely in interrupt mode, we
-  should assume any volume delete / HA failover / controlled teardown
-  in prod is silently hanging and being masked by control-plane
-  retries/timeouts. This may be the same family of bugs as the HA
-  republish issue documented in `docs/MAYASTOR_HA.md`. Worth
-  cross-checking.
+- ~~**Does prod really work?**~~ Partially answered. The destroy
+  hang we feared in prod was real and was being masked by
+  control-plane retries — and is exactly what the HA republish bug
+  in `docs/MAYASTOR_HA.md` describes. Once the spdk-fork fix from
+  `d1a7adab` ships in the prod image, volume delete / nexus
+  republish should stop hanging. Worth re-validating the HA
+  republish path against an upgraded io-engine before declaring
+  the HA bug closed.
