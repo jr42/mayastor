@@ -16,7 +16,7 @@ services:
       - ENABLE_INTERRUPT_MODE=${ENABLE_INTERRUPT_MODE:-false}
       - NVME_IOQ_POLL_PERIOD=${NVME_IOQ_POLL_PERIOD:-}
       - RUST_LOG=${RUST_LOG:-info}
-    command: ${SRCDIR}/${IO_ENGINE_DIR}/io-engine -g 0.0.0.0 -l 1 -r /tmp/ms0.sock
+    command: ${SRCDIR}/${IO_ENGINE_DIR}/io-engine -g 0.0.0.0 -l ${MS0_CORES:-1} -r /tmp/ms0.sock
     networks:
       mayastor_net:
         ipv4_address: 10.1.0.2
@@ -47,7 +47,7 @@ services:
       - ENABLE_INTERRUPT_MODE=${ENABLE_INTERRUPT_MODE:-false}
       - NVME_IOQ_POLL_PERIOD=${NVME_IOQ_POLL_PERIOD:-}
       - RUST_LOG=${RUST_LOG:-info}
-    command: ${SRCDIR}/${IO_ENGINE_DIR}/io-engine -g 0.0.0.0 -l 2 -r /tmp/ms1.sock
+    command: ${SRCDIR}/${IO_ENGINE_DIR}/io-engine -g 0.0.0.0 -l ${MS1_CORES:-2} -r /tmp/ms1.sock
     networks:
       mayastor_net:
         ipv4_address: 10.1.0.3
